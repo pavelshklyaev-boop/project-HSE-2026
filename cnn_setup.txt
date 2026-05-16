@@ -1,0 +1,20 @@
+from google.colab import drive
+drive.mount("/content/drive")
+
+!pip -q install librosa pretty_midi soundfile tqdm pandas numpy matplotlib scikit-learn mir_eval thop
+
+from pathlib import Path
+
+PROJECT_ROOT = Path("/content/drive/MyDrive/CompactAMTmodels")
+PROJECT_ROOT.parent.mkdir(parents=True, exist_ok=True)
+
+if not PROJECT_ROOT.exists():
+    !git clone https://github.com/Armagab/CompactAMTmodels.git "{PROJECT_ROOT}"
+else:
+    print("Repository already exists:", PROJECT_ROOT)
+
+COLAB_SCRIPTS_DIR = PROJECT_ROOT / "colab_scripts"
+COLAB_SCRIPTS_DIR.mkdir(parents=True, exist_ok=True)
+
+print("PROJECT_ROOT:", PROJECT_ROOT)
+print("COLAB_SCRIPTS_DIR:", COLAB_SCRIPTS_DIR)

@@ -1,0 +1,72 @@
+Команды запуска
+Проверка preprocessing на 10 треках
+!python "/content/drive/MyDrive/CompactAMTmodels/colab_scripts/01_prepare_maestro_features.py" \
+  --dataset-root "/content/drive/MyDrive/maestro-v3.0.0" \
+  --output-root "/content/drive/MyDrive/CompactAMTmodels/preprocessed_dataset" \
+  --representation mel \
+  --max-tracks 10
+Полная подготовка Log-Mel
+!python "/content/drive/MyDrive/CompactAMTmodels/colab_scripts/01_prepare_maestro_features.py" \
+  --dataset-root "/content/drive/MyDrive/maestro-v3.0.0" \
+  --output-root "/content/drive/MyDrive/CompactAMTmodels/preprocessed_dataset" \
+  --representation mel
+Быстрое обучение на 2 эпохах
+!python "/content/drive/MyDrive/CompactAMTmodels/colab_scripts/02_train_cnn.py" \
+  --project-root "/content/drive/MyDrive/CompactAMTmodels" \
+  --features-root "/content/drive/MyDrive/CompactAMTmodels/preprocessed_dataset" \
+  --representation mel \
+  --epochs 2 \
+  --batch-size 16 \
+  --segment-frames 1024 \
+  --loader-workers 4 \
+  --initial-learning-rate 7e-4 \
+  --regularization-weight 1e-4 \
+  --active-note-weight 4.0 \
+  --activation-threshold 0.55
+Полное обучение CNN
+!python "/content/drive/MyDrive/CompactAMTmodels/colab_scripts/02_train_cnn.py" \
+  --project-root "/content/drive/MyDrive/CompactAMTmodels" \
+  --features-root "/content/drive/MyDrive/CompactAMTmodels/preprocessed_dataset" \
+  --representation mel \
+  --epochs 120 \
+  --batch-size 16 \
+  --segment-frames 1024 \
+  --loader-workers 4 \
+  --initial-learning-rate 7e-4 \
+  --regularization-weight 1e-4 \
+  --active-note-weight 4.0 \
+  --activation-threshold 0.55
+Быстрое тестирование на 5 треках
+!python "/content/drive/MyDrive/CompactAMTmodels/colab_scripts/03_evaluate_cnn.py" \
+  --project-root "/content/drive/MyDrive/CompactAMTmodels" \
+  --features-root "/content/drive/MyDrive/CompactAMTmodels/preprocessed_dataset" \
+  --checkpoint "/content/drive/MyDrive/CompactAMTmodels/checkpoints/cnn_mel_best.pt" \
+  --representation mel \
+  --activation-threshold 0.55 \
+  --onset-tolerance 0.05 \
+  --max-tracks 5
+Полное тестирование
+!python "/content/drive/MyDrive/CompactAMTmodels/colab_scripts/03_evaluate_cnn.py" \
+  --project-root "/content/drive/MyDrive/CompactAMTmodels" \
+  --features-root "/content/drive/MyDrive/CompactAMTmodels/preprocessed_dataset" \
+  --checkpoint "/content/drive/MyDrive/CompactAMTmodels/checkpoints/cnn_mel_best.pt" \
+  --representation mel \
+  --activation-threshold 0.55 \
+  --onset-tolerance 0.05
+
+Если при тестировании не хватает памяти GPU:
+
+!python "/content/drive/MyDrive/CompactAMTmodels/colab_scripts/03_evaluate_cnn.py" \
+  --project-root "/content/drive/MyDrive/CompactAMTmodels" \
+  --features-root "/content/drive/MyDrive/CompactAMTmodels/preprocessed_dataset" \
+  --checkpoint "/content/drive/MyDrive/CompactAMTmodels/checkpoints/cnn_mel_best.pt" \
+  --representation mel \
+  --activation-threshold 0.55 \
+  --onset-tolerance 0.05 \
+  --evaluation-segment-frames 4096 \
+  --context-frames 64
+
+Результаты будут здесь:
+
+/content/drive/MyDrive/CompactAMTmodels/test_results/cnn_mel_evaluation_summary.json
+/content/drive/MyDrive/CompactAMTmodels/test_results/cnn_mel_evaluation_per_track.csv

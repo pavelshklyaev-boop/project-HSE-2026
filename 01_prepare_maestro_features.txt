@@ -1,0 +1,268 @@
+%%writefile /content/drive/MyDrive/CompactAMTmodels/colab_scripts/01_prepare_maestro_features.py
+import argparse
+import gc
+import warnings
+from pathlib import Path
+
+import librosa
+import numpy as np
+import pandas as pd
+import pretty_midi
+from tqdm import tqdm
+
+warnings.filterwarnings("ignore")
+
+
+SAMPLE_RATE = 22050
+HOP_SIZE = 512
+
+FFT_WINDOW = 2048
+MEL_BANDS = 229
+
+CQT_BANDS = 252
+CQT_BANDS_PER_OCTAVE = 36
+CQT_MIN_FREQUENCY = librosa.note_to_hz("A0")
+
+FIRST_PIANO_MIDI = 21
+LAST_PIANO_MIDI_EXCLUSIVE = 109
+PIANO_KEY_COUNT = 88
+
+FEATURE_DTYPE = np.float16
+TARGET_DTYPE = np.uint8
+
+
+def locate_metadata_file(dataset_root: Path) -> Path:
+    candidates = sorted(dataset_root.glob("maestro-v*.csv"))
+    if not candidates:
+        candidates = sorted(dataset_root.glob("*.csv"))
+    if not candidates:
+        raise FileNotFoundError(f"CSV metadata file was not found in {dataset_root}")
+    return candidates[0]
+
+
+def create_output_tree(output_root: Path):
+    for split_alias in ["train", "val", "test"]:
+        for folder_name in ["audio_mel", "audio_cqt", "midi"]:
+            (output_root / f"{split_alias}_split" / folder_name).mkdir(
+                parents=True,
+                exist_ok=True,
+            )
+
+
+def split_to_folder_name(split_value: str) -> str:
+    split_value = str(split_value).strip().lower()
+    if split_value == "validation":
+        return "val"
+    if split_value in {"train", "val", "test"}:
+        return split_value
+    raise ValueError(f"Unknown split name: {split_value}")
+
+
+def unique_track_stem(relative_audio_path: str) -> str:
+    path = Path(relative_audio_path)
+    return "__".join(path.with_suffix("").parts)
+
+
+def resolve_metadata_columns(table: pd.DataFrame):
+    audio_column = None
+    midi_column = None
+
+    for candidate in ["audio_filename", "audio_file", "audio"]:
+        if candidate in table.columns:
+            audio_column = candidate
+            break
+
+    for candidate in ["midi_filename", "midi_file", "midi"]:
+        if candidate in table.columns:
+            midi_column = candidate
+            break
+
+    if audio_column is None or midi_column is None:
+        raise ValueError(f"Could not find audio/midi columns. Columns: {list(table.columns)}")
+
+    if "split" not in table.columns:
+        raise ValueError("MAESTRO metadata must contain 'split' column.")
+
+    return audio_column, midi_column
+
+
+def read_audio_file(audio_path: Path) -> np.ndarray:
+    signal, _ = librosa.load(str(audio_path), sr=SAMPLE_RATE, mono=True)
+    return signal.astype(np.float32)
+
+
+def make_log_mel(signal: np.ndarray) -> np.ndarray:
+    mel_power = librosa.feature.melspectrogram(
+        y=signal,
+        sr=SAMPLE_RATE,
+        n_fft=FFT_WINDOW,
+        hop_length=HOP_SIZE,
+        n_mels=MEL_BANDS,
+        power=2.0,
+    )
+    mel_db = librosa.power_to_db(mel_power, ref=np.max)
+    return mel_db.astype(FEATURE_DTYPE)
+
+
+def make_cqt(signal: np.ndarray) -> np.ndarray:
+    cqt_complex = librosa.cqt(
+        y=signal,
+        sr=SAMPLE_RATE,
+        hop_length=HOP_SIZE,
+        fmin=CQT_MIN_FREQUENCY,
+        n_bins=CQT_BANDS,
+        bins_per_octave=CQT_BANDS_PER_OCTAVE,
+    )
+    cqt_db = librosa.amplitude_to_db(np.abs(cqt_complex), ref=np.max)
+    return cqt_db.astype(FEATURE_DTYPE)
+
+
+def make_piano_roll(midi_path: Path, target_frames: int) -> np.ndarray:
+    midi = pretty_midi.PrettyMIDI(str(midi_path))
+
+    frame_rate = SAMPLE_RATE / HOP_SIZE
+    roll = midi.get_piano_roll(fs=frame_rate)
+
+    roll = roll[FIRST_PIANO_MIDI:LAST_PIANO_MIDI_EXCLUSIVE, :]
+    roll = (roll > 0).astype(TARGET_DTYPE)
+    roll = roll.T
+
+    if roll.shape[0] < target_frames:
+        pad = target_frames - roll.shape[0]
+        roll = np.pad(roll, ((0, pad), (0, 0)), mode="constant", constant_values=0)
+    elif roll.shape[0] > target_frames:
+        roll = roll[:target_frames, :]
+
+    return roll.astype(TARGET_DTYPE)
+
+
+def process_track(row, dataset_root, output_root, audio_column, midi_column, representation, force_rebuild):
+    split_name = split_to_folder_name(row["split"])
+
+    audio_relative_path = row[audio_column]
+    midi_relative_path = row[midi_column]
+
+    audio_path = dataset_root / audio_relative_path
+    midi_path = dataset_root / midi_relative_path
+
+    if not audio_path.exists():
+        raise FileNotFoundError(f"Audio file not found: {audio_path}")
+    if not midi_path.exists():
+        raise FileNotFoundError(f"MIDI file not found: {midi_path}")
+
+    track_stem = unique_track_stem(audio_relative_path)
+
+    mel_path = output_root / f"{split_name}_split" / "audio_mel" / f"{track_stem}.npy"
+    cqt_path = output_root / f"{split_name}_split" / "audio_cqt" / f"{track_stem}.npy"
+    roll_path = output_root / f"{split_name}_split" / "midi" / f"{track_stem}.npy"
+
+    need_mel = representation in {"mel", "both"}
+    need_cqt = representation in {"cqt", "both"}
+
+    expected_files = [roll_path]
+    if need_mel:
+        expected_files.append(mel_path)
+    if need_cqt:
+        expected_files.append(cqt_path)
+
+    if not force_rebuild and all(path.exists() for path in expected_files):
+        return "skipped"
+
+    signal = read_audio_file(audio_path)
+
+    mel_features = None
+    cqt_features = None
+
+    if need_mel:
+        mel_features = make_log_mel(signal)
+        np.save(mel_path, mel_features)
+
+    if need_cqt:
+        cqt_features = make_cqt(signal)
+        np.save(cqt_path, cqt_features)
+
+    if mel_features is not None:
+        reference_frames = mel_features.shape[1]
+    elif cqt_features is not None:
+        reference_frames = cqt_features.shape[1]
+    else:
+        raise RuntimeError("No representation was selected.")
+
+    piano_roll = make_piano_roll(midi_path, target_frames=reference_frames)
+    np.save(roll_path, piano_roll)
+
+    del signal, mel_features, cqt_features, piano_roll
+    gc.collect()
+
+    return "processed"
+
+
+def main():
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument("--dataset-root", type=str, required=True)
+    parser.add_argument("--output-root", type=str, required=True)
+    parser.add_argument("--representation", type=str, default="mel", choices=["mel", "cqt", "both"])
+    parser.add_argument("--max-tracks", type=int, default=None)
+    parser.add_argument("--force-rebuild", action="store_true")
+
+    args = parser.parse_args()
+
+    dataset_root = Path(args.dataset_root)
+    output_root = Path(args.output_root)
+
+    metadata_path = locate_metadata_file(dataset_root)
+    metadata = pd.read_csv(metadata_path)
+
+    audio_column, midi_column = resolve_metadata_columns(metadata)
+
+    if args.max_tracks is not None:
+        metadata = metadata.head(args.max_tracks).copy()
+
+    create_output_tree(output_root)
+
+    print("Dataset root:", dataset_root)
+    print("Metadata:", metadata_path)
+    print("Output root:", output_root)
+    print("Representation:", args.representation)
+    print("Rows:", len(metadata))
+    print("Splits:", metadata["split"].value_counts().to_dict())
+
+    processed = 0
+    skipped = 0
+    errors = []
+
+    for row_index, row in tqdm(metadata.iterrows(), total=len(metadata), desc="Preparing features"):
+        try:
+            status = process_track(
+                row=row,
+                dataset_root=dataset_root,
+                output_root=output_root,
+                audio_column=audio_column,
+                midi_column=midi_column,
+                representation=args.representation,
+                force_rebuild=args.force_rebuild,
+            )
+
+            if status == "processed":
+                processed += 1
+            else:
+                skipped += 1
+
+        except Exception as exc:
+            errors.append((row_index, str(exc)))
+            print(f"\nError at row {row_index}: {exc}")
+
+    print("\nDone.")
+    print("Processed:", processed)
+    print("Skipped:", skipped)
+    print("Errors:", len(errors))
+
+    if errors:
+        print("First errors:")
+        for item in errors[:20]:
+            print(item)
+
+
+if __name__ == "__main__":
+    main()

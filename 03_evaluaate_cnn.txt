@@ -1,0 +1,418 @@
+%%writefile /content/drive/MyDrive/CompactAMTmodels/colab_scripts/03_evaluate_cnn.py
+import argparse
+import csv
+import json
+import os
+import sys
+import time
+from pathlib import Path
+
+import numpy as np
+import torch
+from torch.utils.data import Dataset
+
+
+SAMPLE_RATE = 22050
+HOP_SIZE = 512
+
+FIRST_PIANO_MIDI = 21
+PIANO_KEY_COUNT = 88
+
+
+def register_project_path(project_root: Path):
+    project_root = project_root.resolve()
+    if str(project_root) not in sys.path:
+        sys.path.insert(0, str(project_root))
+
+
+class CompleteTrackDataset(Dataset):
+    def __init__(self, features_root: str, split_name: str, representation: str):
+        self.features_root = Path(features_root)
+        self.split_name = split_name
+        self.representation = representation
+
+        split_dir = self.features_root / f"{split_name}_split"
+
+        if representation == "mel":
+            self.audio_dir = split_dir / "audio_mel"
+        elif representation == "cqt":
+            self.audio_dir = split_dir / "audio_cqt"
+        else:
+            raise ValueError("representation must be either 'mel' or 'cqt'.")
+
+        self.target_dir = split_dir / "midi"
+
+        audio_files = sorted([f for f in os.listdir(self.audio_dir) if f.endswith(".npy")])
+        target_files = sorted([f for f in os.listdir(self.target_dir) if f.endswith(".npy")])
+
+        audio_map = {Path(f).stem: self.audio_dir / f for f in audio_files}
+        target_map = {Path(f).stem: self.target_dir / f for f in target_files}
+
+        common_keys = sorted(set(audio_map.keys()) & set(target_map.keys()))
+        self.items = [(key, audio_map[key], target_map[key]) for key in common_keys]
+
+        if not self.items:
+            raise RuntimeError(f"No matching .npy pairs found in {self.audio_dir} and {self.target_dir}")
+
+    def __len__(self):
+        return len(self.items)
+
+    def __getitem__(self, index):
+        track_name, feature_path, target_path = self.items[index]
+
+        features = np.load(feature_path).astype(np.float32)
+        target = np.load(target_path).astype(np.float32)
+
+        if target.shape[0] == PIANO_KEY_COUNT and target.shape[1] == features.shape[1]:
+            target = target.T
+        elif target.shape[1] == PIANO_KEY_COUNT:
+            pass
+        else:
+            raise ValueError(f"Wrong piano roll shape: {target.shape}")
+
+        frame_count = min(features.shape[1], target.shape[0])
+
+        features = features[:, :frame_count]
+        target = target[:frame_count, :]
+        target = (target > 0).astype(np.float32)
+
+        return track_name, features, target
+
+
+@torch.no_grad()
+def predict_track(model, features, device, evaluation_segment_frames, context_frames):
+    model.eval()
+
+    total_frames = features.shape[1]
+
+    if evaluation_segment_frames <= 0 or total_frames <= evaluation_segment_frames:
+        x = torch.from_numpy(features).float().unsqueeze(0).unsqueeze(0).to(device)
+        logits = model(x)
+        return torch.sigmoid(logits).squeeze(0).cpu().numpy()
+
+    outputs = []
+
+    start = 0
+    while start < total_frames:
+        end = min(start + evaluation_segment_frames, total_frames)
+
+        extended_start = max(0, start - context_frames)
+        extended_end = min(total_frames, end + context_frames)
+
+        x_part = features[:, extended_start:extended_end]
+
+        x = torch.from_numpy(x_part).float().unsqueeze(0).unsqueeze(0).to(device)
+        logits = model(x)
+        probabilities = torch.sigmoid(logits).squeeze(0).cpu().numpy()
+
+        crop_start = start - extended_start
+        crop_end = crop_start + (end - start)
+
+        outputs.append(probabilities[crop_start:crop_end, :])
+
+        start = end
+
+    return np.concatenate(outputs, axis=0)
+
+
+def frame_counts(predicted, reference):
+    predicted = predicted.astype(bool)
+    reference = reference.astype(bool)
+
+    tp = np.logical_and(predicted, reference).sum()
+    fp = np.logical_and(predicted, np.logical_not(reference)).sum()
+    tn = np.logical_and(np.logical_not(predicted), np.logical_not(reference)).sum()
+    fn = np.logical_and(np.logical_not(predicted), reference).sum()
+
+    return int(tp), int(fp), int(tn), int(fn)
+
+
+def safe_div(num, den):
+    return num / (den + 1e-8)
+
+
+def metrics_from_counts(tp, fp, tn, fn):
+    accuracy = safe_div(tp + tn, tp + fp + tn + fn)
+    precision = safe_div(tp, tp + fp)
+    recall = safe_div(tp, tp + fn)
+    f1 = safe_div(2 * precision * recall, precision + recall)
+
+    return accuracy, precision, recall, f1
+
+
+def extract_onsets(binary_roll, frame_duration):
+    events = []
+
+    frame_count, pitch_count = binary_roll.shape
+
+    for pitch_index in range(pitch_count):
+        active = False
+        onset_frame = 0
+
+        for frame_index in range(frame_count):
+            value = bool(binary_roll[frame_index, pitch_index])
+
+            if not active and value:
+                active = True
+                onset_frame = frame_index
+
+            elif active and not value:
+                midi_pitch = FIRST_PIANO_MIDI + pitch_index
+                onset_time = onset_frame * frame_duration
+                events.append((midi_pitch, onset_time))
+                active = False
+
+        if active:
+            midi_pitch = FIRST_PIANO_MIDI + pitch_index
+            onset_time = onset_frame * frame_duration
+            events.append((midi_pitch, onset_time))
+
+    return events
+
+
+def onset_micro_counts(predicted_roll, reference_roll, frame_duration, tolerance):
+    predicted_events = extract_onsets(predicted_roll.astype(bool), frame_duration)
+    reference_events = extract_onsets(reference_roll.astype(bool), frame_duration)
+
+    used_prediction = [False] * len(predicted_events)
+
+    tp = 0
+
+    for ref_pitch, ref_onset in reference_events:
+        best_index = None
+        best_distance = None
+
+        for pred_index, (pred_pitch, pred_onset) in enumerate(predicted_events):
+            if used_prediction[pred_index]:
+                continue
+            if pred_pitch != ref_pitch:
+                continue
+
+            distance = abs(pred_onset - ref_onset)
+
+            if distance <= tolerance:
+                if best_distance is None or distance < best_distance:
+                    best_distance = distance
+                    best_index = pred_index
+
+        if best_index is not None:
+            used_prediction[best_index] = True
+            tp += 1
+
+    fp = len(predicted_events) - tp
+    fn = len(reference_events) - tp
+
+    return tp, fp, fn, len(predicted_events), len(reference_events)
+
+
+def note_metrics_from_counts(tp, fp, fn):
+    accuracy = safe_div(tp, tp + fp + fn)
+    precision = safe_div(tp, tp + fp)
+    recall = safe_div(tp, tp + fn)
+    f1 = safe_div(2 * precision * recall, precision + recall)
+
+    return accuracy, precision, recall, f1
+
+
+def main():
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument("--project-root", type=str, required=True)
+    parser.add_argument("--features-root", type=str, required=True)
+    parser.add_argument("--checkpoint", type=str, required=True)
+
+    parser.add_argument("--representation", type=str, default="mel", choices=["mel", "cqt"])
+    parser.add_argument("--activation-threshold", type=float, default=0.55)
+    parser.add_argument("--onset-tolerance", type=float, default=0.05)
+
+    parser.add_argument("--evaluation-segment-frames", type=int, default=0)
+    parser.add_argument("--context-frames", type=int, default=64)
+    parser.add_argument("--max-tracks", type=int, default=None)
+
+    args = parser.parse_args()
+
+    project_root = Path(args.project_root)
+    features_root = Path(args.features_root)
+    checkpoint_path = Path(args.checkpoint)
+
+    register_project_path(project_root)
+
+    from models.cnn_amt import CNNTemporal
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    frequency_bins = 229 if args.representation == "mel" else 252
+
+    model = CNNTemporal(
+        n_freq_bins=frequency_bins,
+        n_pitches=PIANO_KEY_COUNT,
+    ).to(device)
+
+    checkpoint_data = torch.load(checkpoint_path, map_location=device)
+
+    if isinstance(checkpoint_data, dict) and "model_state_dict" in checkpoint_data:
+        model.load_state_dict(checkpoint_data["model_state_dict"])
+    else:
+        model.load_state_dict(checkpoint_data)
+
+    model.eval()
+
+    test_dataset = CompleteTrackDataset(
+        features_root=str(features_root),
+        split_name="test",
+        representation=args.representation,
+    )
+
+    if args.max_tracks is not None:
+        test_indices = list(range(min(args.max_tracks, len(test_dataset))))
+    else:
+        test_indices = list(range(len(test_dataset)))
+
+    output_dir = project_root / "test_results"
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    csv_path = output_dir / f"cnn_{args.representation}_evaluation_per_track.csv"
+    json_path = output_dir / f"cnn_{args.representation}_evaluation_summary.json"
+
+    print("Project root:", project_root)
+    print("Features root:", features_root)
+    print("Checkpoint:", checkpoint_path)
+    print("Representation:", args.representation)
+    print("Device:", device)
+    print("Tracks:", len(test_indices))
+
+    total_frame_tp = 0
+    total_frame_fp = 0
+    total_frame_tn = 0
+    total_frame_fn = 0
+
+    total_note_tp = 0
+    total_note_fp = 0
+    total_note_fn = 0
+
+    rows = []
+    frame_duration = HOP_SIZE / SAMPLE_RATE
+
+    started_at = time.time()
+
+    for order, dataset_index in enumerate(test_indices, start=1):
+        track_name, features, reference_roll = test_dataset[dataset_index]
+
+        probabilities = predict_track(
+            model=model,
+            features=features,
+            device=device,
+            evaluation_segment_frames=args.evaluation_segment_frames,
+            context_frames=args.context_frames,
+        )
+
+        common_frames = min(probabilities.shape[0], reference_roll.shape[0])
+        probabilities = probabilities[:common_frames, :]
+        reference_roll = reference_roll[:common_frames, :]
+
+        predicted_roll = probabilities >= args.activation_threshold
+        reference_binary = reference_roll >= 0.5
+
+        ftp, ffp, ftn, ffn = frame_counts(predicted_roll, reference_binary)
+
+        total_frame_tp += ftp
+        total_frame_fp += ffp
+        total_frame_tn += ftn
+        total_frame_fn += ffn
+
+        fa, fp, fr, ff1 = metrics_from_counts(ftp, ffp, ftn, ffn)
+
+        ntp, nfp, nfn, predicted_notes, reference_notes = onset_micro_counts(
+            predicted_roll=predicted_roll,
+            reference_roll=reference_binary,
+            frame_duration=frame_duration,
+            tolerance=args.onset_tolerance,
+        )
+
+        total_note_tp += ntp
+        total_note_fp += nfp
+        total_note_fn += nfn
+
+        na, np_, nr, nf1 = note_metrics_from_counts(ntp, nfp, nfn)
+
+        rows.append(
+            {
+                "track": track_name,
+                "frames": int(common_frames),
+                "frame_accuracy": fa,
+                "frame_precision": fp,
+                "frame_recall": fr,
+                "frame_f1": ff1,
+                "note_onset_accuracy": na,
+                "note_onset_precision": np_,
+                "note_onset_recall": nr,
+                "note_onset_f1": nf1,
+                "predicted_notes": predicted_notes,
+                "reference_notes": reference_notes,
+            }
+        )
+
+        print(
+            f"[{order}/{len(test_indices)}] {track_name} | "
+            f"Frame F1={ff1:.4f} | "
+            f"Note-Onset F1={nf1:.4f}"
+        )
+
+    frame_accuracy, frame_precision, frame_recall, frame_f1 = metrics_from_counts(
+        total_frame_tp,
+        total_frame_fp,
+        total_frame_tn,
+        total_frame_fn,
+    )
+
+    note_accuracy, note_precision, note_recall, note_f1 = note_metrics_from_counts(
+        total_note_tp,
+        total_note_fp,
+        total_note_fn,
+    )
+
+    summary = {
+        "representation": args.representation,
+        "checkpoint": str(checkpoint_path),
+        "activation_threshold": args.activation_threshold,
+        "onset_tolerance": args.onset_tolerance,
+        "track_count": len(test_indices),
+        "frame_micro": {
+            "accuracy": frame_accuracy,
+            "precision": frame_precision,
+            "recall": frame_recall,
+            "f1": frame_f1,
+            "tp": total_frame_tp,
+            "fp": total_frame_fp,
+            "tn": total_frame_tn,
+            "fn": total_frame_fn,
+        },
+        "note_onset_micro": {
+            "accuracy": note_accuracy,
+            "precision": note_precision,
+            "recall": note_recall,
+            "f1": note_f1,
+            "tp": total_note_tp,
+            "fp": total_note_fp,
+            "fn": total_note_fn,
+        },
+        "elapsed_seconds": time.time() - started_at,
+    }
+
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(rows)
+
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2)
+
+    print("\n=== EVALUATION SUMMARY ===")
+    print(json.dumps(summary, indent=2))
+
+    print("CSV:", csv_path)
+    print("JSON:", json_path)
+
+
+if __name__ == "__main__":
+    main()
