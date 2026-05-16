@@ -1,0 +1,747 @@
+%%writefile "/content/drive/MyDrive/CompactAMTmodels/colab_scripts/04_run_nmf_baselines.py"
+
+import argparse
+import json
+import math
+import re
+import time
+from pathlib import Path
+
+import librosa
+import numpy as np
+import pandas as pd
+import pretty_midi
+from scipy.ndimage import median_filter
+from scipy.optimize import nnls
+from sklearn.decomposition import NMF
+from tqdm import tqdm
+
+
+MIDI_MIN = 21
+MIDI_MAX = 108
+N_PITCHES = 88
+
+
+def safe_div(num, den):
+    return float(num / den) if den != 0 else 0.0
+
+
+def f1_score(precision, recall):
+    return safe_div(2.0 * precision * recall, precision + recall)
+
+
+def load_maestro_metadata(dataset_root: Path, split: str):
+    csv_files = list(dataset_root.glob("*.csv"))
+    if not csv_files:
+        raise FileNotFoundError(
+            f"Не найден CSV metadata файл в {dataset_root}. "
+            "Обычно это maestro-v3.0.0.csv"
+        )
+
+    metadata_path = csv_files[0]
+    df = pd.read_csv(metadata_path)
+
+    required = {"audio_filename", "midi_filename", "split"}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(f"В metadata CSV отсутствуют колонки: {missing}")
+
+    df = df[df["split"] == split].reset_index(drop=True)
+    if df.empty:
+        raise ValueError(f"В split={split} не найдено записей.")
+
+    return df
+
+
+def load_audio(audio_path: Path, sample_rate: int):
+    y, _ = librosa.load(audio_path, sr=sample_rate, mono=True)
+    if len(y) == 0:
+        raise ValueError(f"Пустой аудиофайл: {audio_path}")
+    return y.astype(np.float32)
+
+
+def magnitude_stft(y, n_fft: int, hop_length: int):
+    stft = librosa.stft(
+        y=y,
+        n_fft=n_fft,
+        hop_length=hop_length,
+        window="hann",
+        center=True,
+    )
+    mag = np.abs(stft).astype(np.float32)
+    return mag
+
+
+def midi_to_piano_roll(midi_path: Path, n_frames: int, sample_rate: int, hop_length: int):
+    """
+    Возвращает piano roll формы (88, T).
+    Строки соответствуют MIDI pitch 21..108.
+    """
+    pm = pretty_midi.PrettyMIDI(str(midi_path))
+    roll = np.zeros((N_PITCHES, n_frames), dtype=np.uint8)
+
+    frame_times = np.arange(n_frames) * hop_length / sample_rate
+
+    for inst in pm.instruments:
+        if inst.is_drum:
+            continue
+
+        for note in inst.notes:
+            if note.pitch < MIDI_MIN or note.pitch > MIDI_MAX:
+                continue
+
+            pitch_idx = note.pitch - MIDI_MIN
+
+            start_frame = int(np.searchsorted(frame_times, note.start, side="left"))
+            end_frame = int(np.searchsorted(frame_times, note.end, side="right"))
+
+            start_frame = max(0, min(start_frame, n_frames))
+            end_frame = max(0, min(end_frame, n_frames))
+
+            if end_frame > start_frame:
+                roll[pitch_idx, start_frame:end_frame] = 1
+
+    return roll
+
+
+def piano_roll_to_notes(roll, sample_rate: int, hop_length: int):
+    """
+    Преобразует piano roll формы (88, T) в список нот:
+    [(midi_pitch, onset_time, offset_time), ...]
+    """
+    notes = []
+    n_pitches, n_frames = roll.shape
+
+    for pitch_idx in range(n_pitches):
+        midi_pitch = pitch_idx + MIDI_MIN
+        active = roll[pitch_idx].astype(bool)
+
+        if not active.any():
+            continue
+
+        padded = np.pad(active.astype(np.int8), (1, 1), mode="constant")
+        diff = np.diff(padded)
+
+        starts = np.where(diff == 1)[0]
+        ends = np.where(diff == -1)[0]
+
+        for s, e in zip(starts, ends):
+            onset = s * hop_length / sample_rate
+            offset = e * hop_length / sample_rate
+            if offset > onset:
+                notes.append((midi_pitch, onset, offset))
+
+    return notes
+
+
+def frame_counts(pred_roll, ref_roll):
+    """
+    pred_roll и ref_roll формы (88, T).
+    """
+    min_t = min(pred_roll.shape[1], ref_roll.shape[1])
+    pred = pred_roll[:, :min_t].astype(bool)
+    ref = ref_roll[:, :min_t].astype(bool)
+
+    tp = np.logical_and(pred, ref).sum()
+    fp = np.logical_and(pred, np.logical_not(ref)).sum()
+    fn = np.logical_and(np.logical_not(pred), ref).sum()
+    tn = np.logical_and(np.logical_not(pred), np.logical_not(ref)).sum()
+
+    return int(tp), int(fp), int(fn), int(tn)
+
+
+def note_onset_counts(pred_notes, ref_notes, onset_tolerance: float):
+    """
+    Сопоставляет предсказанные и эталонные ноты по pitch и onset.
+    Offset в этой версии не учитывается.
+    """
+    matched_ref = set()
+    tp = 0
+
+    pred_notes = sorted(pred_notes, key=lambda x: x[1])
+    ref_notes = sorted(ref_notes, key=lambda x: x[1])
+
+    for pred_idx, (pred_pitch, pred_onset, pred_offset) in enumerate(pred_notes):
+        best_ref = None
+        best_diff = None
+
+        for ref_idx, (ref_pitch, ref_onset, ref_offset) in enumerate(ref_notes):
+            if ref_idx in matched_ref:
+                continue
+            if ref_pitch != pred_pitch:
+                continue
+
+            diff = abs(pred_onset - ref_onset)
+
+            if diff <= onset_tolerance:
+                if best_diff is None or diff < best_diff:
+                    best_diff = diff
+                    best_ref = ref_idx
+
+        if best_ref is not None:
+            matched_ref.add(best_ref)
+            tp += 1
+
+    fp = len(pred_notes) - tp
+    fn = len(ref_notes) - tp
+
+    return int(tp), int(fp), int(fn)
+
+
+def remove_short_events(binary_roll, min_active_frames: int):
+    """
+    Удаляет события короче min_active_frames.
+    """
+    cleaned = binary_roll.copy()
+
+    for p in range(cleaned.shape[0]):
+        active = cleaned[p].astype(bool)
+        padded = np.pad(active.astype(np.int8), (1, 1), mode="constant")
+        diff = np.diff(padded)
+
+        starts = np.where(diff == 1)[0]
+        ends = np.where(diff == -1)[0]
+
+        for s, e in zip(starts, ends):
+            if e - s < min_active_frames:
+                cleaned[p, s:e] = 0
+
+    return cleaned
+
+
+def denoise_activations(
+    activations,
+    relative_threshold: float,
+    top_k: int,
+    smooth_window: int,
+    min_active_frames: int,
+):
+    """
+    activations формы (88, T).
+    Возвращает бинарный piano roll формы (88, T).
+    """
+    H = np.maximum(activations, 0.0).astype(np.float32)
+
+    row_max = H.max(axis=1, keepdims=True) + 1e-8
+    H_norm = H / row_max
+
+    binary = (H_norm >= relative_threshold).astype(np.uint8)
+
+    if top_k is not None and top_k > 0:
+        filtered = np.zeros_like(binary)
+
+        for t in range(H.shape[1]):
+            column = H_norm[:, t]
+            active_idx = np.where(binary[:, t] > 0)[0]
+
+            if len(active_idx) == 0:
+                continue
+
+            top_idx = active_idx[np.argsort(column[active_idx])[-top_k:]]
+            filtered[top_idx, t] = 1
+
+        binary = filtered
+
+    if smooth_window is not None and smooth_window > 1:
+        binary = median_filter(binary, size=(1, smooth_window)).astype(np.uint8)
+
+    if min_active_frames is not None and min_active_frames > 1:
+        binary = remove_short_events(binary, min_active_frames)
+
+    return binary.astype(np.uint8)
+
+
+def hz_to_midi_safe(freq):
+    if freq <= 0 or not np.isfinite(freq):
+        return None
+
+    midi = int(round(librosa.hz_to_midi(freq)))
+
+    if midi < MIDI_MIN or midi > MIDI_MAX:
+        return None
+
+    return midi
+
+
+def map_unsupervised_components_to_pitches(W, activations, sample_rate: int, n_fft: int):
+    """
+    W: (K, R)
+    activations: (R, T)
+
+    Возвращает activations_mapped формы (88, T).
+    Компоненты сопоставляются с MIDI pitch по частоте максимального пика.
+    """
+    freqs = librosa.fft_frequencies(sr=sample_rate, n_fft=n_fft)
+    mapped = np.zeros((N_PITCHES, activations.shape[1]), dtype=np.float32)
+
+    for r in range(W.shape[1]):
+        template = W[:, r]
+        peak_bin = int(np.argmax(template))
+        peak_freq = freqs[peak_bin]
+        midi = hz_to_midi_safe(peak_freq)
+
+        if midi is None:
+            continue
+
+        pitch_idx = midi - MIDI_MIN
+        mapped[pitch_idx] = np.maximum(mapped[pitch_idx], activations[r])
+
+    return mapped
+
+
+def run_unsupervised_nmf(V, n_components: int, max_iter: int, random_state: int):
+    """
+    V: magnitude spectrogram формы (K, T).
+
+    sklearn NMF ожидает матрицу samples x features.
+    Поэтому используем V.T: (T, K).
+    """
+    model = NMF(
+        n_components=n_components,
+        init="nndsvda",
+        solver="mu",
+        beta_loss="kullback-leibler",
+        max_iter=max_iter,
+        random_state=random_state,
+        tol=1e-4,
+    )
+
+    W_time = model.fit_transform(np.maximum(V.T, 1e-8))  # (T, R)
+    H_freq = model.components_  # (R, K)
+
+    templates = H_freq.T  # (K, R)
+    activations = W_time.T  # (R, T)
+
+    return templates, activations
+
+
+def parse_note_name_from_filename(path: Path):
+    """
+    Поддерживает имена вроде:
+    A0.wav, A#0.wav, Bb3.wav, C4_piano.wav, note_C#5.wav
+    """
+    stem = path.stem
+
+    match = re.search(r"([A-Ga-g])([#bB]?)(-?\d)", stem)
+    if not match:
+        return None
+
+    note = match.group(1).upper()
+    accidental = match.group(2)
+    octave = int(match.group(3))
+
+    if accidental in ["b", "B"]:
+        flat_to_sharp = {
+            "DB": "C#",
+            "EB": "D#",
+            "GB": "F#",
+            "AB": "G#",
+            "BB": "A#",
+        }
+        name = note + "B"
+        if name not in flat_to_sharp:
+            return None
+        note_name = flat_to_sharp[name] + str(octave)
+    else:
+        note_name = note + accidental + str(octave)
+
+    try:
+        midi = pretty_midi.note_name_to_number(note_name)
+    except Exception:
+        return None
+
+    if midi < MIDI_MIN or midi > MIDI_MAX:
+        return None
+
+    return midi
+
+
+def build_w_fixed(
+    isolated_notes_dir: Path,
+    sample_rate: int,
+    n_fft: int,
+    hop_length: int,
+):
+    """
+    Строит W_fixed формы (K, 88).
+    Каждый столбец — шаблон одной ноты.
+    """
+    if isolated_notes_dir is None:
+        raise ValueError("Для supervised NMF нужно указать --isolated-notes-dir")
+
+    if not isolated_notes_dir.exists():
+        raise FileNotFoundError(f"Папка isolated notes не найдена: {isolated_notes_dir}")
+
+    wav_files = sorted(
+        list(isolated_notes_dir.glob("*.wav")) +
+        list(isolated_notes_dir.glob("*.mp3")) +
+        list(isolated_notes_dir.glob("*.flac"))
+    )
+
+    if not wav_files:
+        raise FileNotFoundError(f"В {isolated_notes_dir} не найдены аудиофайлы нот.")
+
+    n_freq = n_fft // 2 + 1
+    W_fixed = np.zeros((n_freq, N_PITCHES), dtype=np.float32)
+    found = []
+
+    for wav_path in tqdm(wav_files, desc="Building W_fixed"):
+        midi = parse_note_name_from_filename(wav_path)
+        if midi is None:
+            continue
+
+        y = load_audio(wav_path, sample_rate=sample_rate)
+        mag = magnitude_stft(y, n_fft=n_fft, hop_length=hop_length)
+
+        template = mag.mean(axis=1)
+        norm = np.linalg.norm(template) + 1e-8
+        template = template / norm
+
+        pitch_idx = midi - MIDI_MIN
+        W_fixed[:, pitch_idx] = np.maximum(W_fixed[:, pitch_idx], template)
+        found.append(midi)
+
+    found = sorted(set(found))
+    missing = [m for m in range(MIDI_MIN, MIDI_MAX + 1) if m not in found]
+
+    print(f"Найдено шаблонов нот: {len(found)} из 88")
+    if missing:
+        print(f"Предупреждение: отсутствуют шаблоны для {len(missing)} нот.")
+        print("Первые отсутствующие MIDI:", missing[:15])
+
+    W_fixed = np.maximum(W_fixed, 1e-8)
+
+    col_norms = np.linalg.norm(W_fixed, axis=0, keepdims=True) + 1e-8
+    W_fixed = W_fixed / col_norms
+
+    return W_fixed.astype(np.float32)
+
+
+def run_supervised_nmf_nnls(V, W_fixed):
+    """
+    V: magnitude spectrogram формы (K, T)
+    W_fixed: (K, 88)
+
+    Для каждого временного фрейма решается NNLS:
+    min ||v_t - W_fixed h_t||, h_t >= 0
+    """
+    n_frames = V.shape[1]
+    H = np.zeros((N_PITCHES, n_frames), dtype=np.float32)
+
+    for t in range(n_frames):
+        h_t, _ = nnls(W_fixed, V[:, t])
+        H[:, t] = h_t.astype(np.float32)
+
+    return H
+
+
+def evaluate_rolls(pred_roll, ref_roll, sample_rate, hop_length, onset_tolerance):
+    ftp, ffp, ffn, ftn = frame_counts(pred_roll, ref_roll)
+
+    pred_notes = piano_roll_to_notes(pred_roll, sample_rate, hop_length)
+    ref_notes = piano_roll_to_notes(ref_roll, sample_rate, hop_length)
+
+    ntp, nfp, nfn = note_onset_counts(
+        pred_notes,
+        ref_notes,
+        onset_tolerance=onset_tolerance,
+    )
+
+    return {
+        "frame_tp": ftp,
+        "frame_fp": ffp,
+        "frame_fn": ffn,
+        "frame_tn": ftn,
+        "note_tp": ntp,
+        "note_fp": nfp,
+        "note_fn": nfn,
+        "predicted_notes": len(pred_notes),
+        "reference_notes": len(ref_notes),
+    }
+
+
+def counts_to_metrics(tp, fp, fn, tn=None):
+    precision = safe_div(tp, tp + fp)
+    recall = safe_div(tp, tp + fn)
+    f1 = f1_score(precision, recall)
+
+    result = {
+        "precision": precision,
+        "recall": recall,
+        "f1": f1,
+        "tp": int(tp),
+        "fp": int(fp),
+        "fn": int(fn),
+    }
+
+    if tn is not None:
+        accuracy = safe_div(tp + tn, tp + fp + fn + tn)
+        result["accuracy"] = accuracy
+        result["tn"] = int(tn)
+
+    return result
+
+
+def aggregate_results(per_track_rows, config, elapsed_seconds):
+    frame_tp = sum(r["frame_tp"] for r in per_track_rows)
+    frame_fp = sum(r["frame_fp"] for r in per_track_rows)
+    frame_fn = sum(r["frame_fn"] for r in per_track_rows)
+    frame_tn = sum(r["frame_tn"] for r in per_track_rows)
+
+    note_tp = sum(r["note_tp"] for r in per_track_rows)
+    note_fp = sum(r["note_fp"] for r in per_track_rows)
+    note_fn = sum(r["note_fn"] for r in per_track_rows)
+
+    return {
+        "frame_micro": counts_to_metrics(frame_tp, frame_fp, frame_fn, frame_tn),
+        "note_onset_micro": counts_to_metrics(note_tp, note_fp, note_fn),
+        "tracks_evaluated": len(per_track_rows),
+        "elapsed_seconds": elapsed_seconds,
+        "config": config,
+    }
+
+
+def add_metrics_to_row(row):
+    frame_precision = safe_div(row["frame_tp"], row["frame_tp"] + row["frame_fp"])
+    frame_recall = safe_div(row["frame_tp"], row["frame_tp"] + row["frame_fn"])
+    frame_f1 = f1_score(frame_precision, frame_recall)
+
+    note_precision = safe_div(row["note_tp"], row["note_tp"] + row["note_fp"])
+    note_recall = safe_div(row["note_tp"], row["note_tp"] + row["note_fn"])
+    note_f1 = f1_score(note_precision, note_recall)
+
+    row["frame_precision"] = frame_precision
+    row["frame_recall"] = frame_recall
+    row["frame_f1"] = frame_f1
+
+    row["note_precision"] = note_precision
+    row["note_recall"] = note_recall
+    row["note_f1"] = note_f1
+
+    return row
+
+
+def process_track_unsupervised(
+    audio_path,
+    midi_path,
+    args,
+):
+    y = load_audio(audio_path, sample_rate=args.sample_rate)
+    V = magnitude_stft(y, n_fft=args.n_fft, hop_length=args.hop_length)
+
+    ref_roll = midi_to_piano_roll(
+        midi_path,
+        n_frames=V.shape[1],
+        sample_rate=args.sample_rate,
+        hop_length=args.hop_length,
+    )
+
+    W, H = run_unsupervised_nmf(
+        V=V,
+        n_components=args.nmf_components,
+        max_iter=args.nmf_max_iter,
+        random_state=args.random_seed,
+    )
+
+    mapped_H = map_unsupervised_components_to_pitches(
+        W=W,
+        activations=H,
+        sample_rate=args.sample_rate,
+        n_fft=args.n_fft,
+    )
+
+    pred_roll = denoise_activations(
+        mapped_H,
+        relative_threshold=args.relative_threshold,
+        top_k=args.top_k,
+        smooth_window=args.smooth_window,
+        min_active_frames=args.min_active_frames,
+    )
+
+    return evaluate_rolls(
+        pred_roll=pred_roll,
+        ref_roll=ref_roll,
+        sample_rate=args.sample_rate,
+        hop_length=args.hop_length,
+        onset_tolerance=args.onset_tolerance,
+    )
+
+
+def process_track_supervised(
+    audio_path,
+    midi_path,
+    args,
+    W_fixed,
+):
+    y = load_audio(audio_path, sample_rate=args.sample_rate)
+    V = magnitude_stft(y, n_fft=args.n_fft, hop_length=args.hop_length)
+
+    ref_roll = midi_to_piano_roll(
+        midi_path,
+        n_frames=V.shape[1],
+        sample_rate=args.sample_rate,
+        hop_length=args.hop_length,
+    )
+
+    H = run_supervised_nmf_nnls(V=V, W_fixed=W_fixed)
+
+    pred_roll = denoise_activations(
+        H,
+        relative_threshold=args.relative_threshold,
+        top_k=args.top_k,
+        smooth_window=args.smooth_window,
+        min_active_frames=args.min_active_frames,
+    )
+
+    return evaluate_rolls(
+        pred_roll=pred_roll,
+        ref_roll=ref_roll,
+        sample_rate=args.sample_rate,
+        hop_length=args.hop_length,
+        onset_tolerance=args.onset_tolerance,
+    )
+
+
+def run_mode(args, mode, metadata_df, W_fixed=None):
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    rows = []
+    start_time = time.time()
+
+    if args.max_tracks is not None and args.max_tracks > 0:
+        metadata_df = metadata_df.head(args.max_tracks).copy()
+
+    iterator = tqdm(metadata_df.iterrows(), total=len(metadata_df), desc=f"Running {mode}")
+
+    for idx, item in iterator:
+        audio_path = Path(args.dataset_root) / item["audio_filename"]
+        midi_path = Path(args.dataset_root) / item["midi_filename"]
+
+        row = {
+            "track_index": int(idx),
+            "audio_filename": item["audio_filename"],
+            "midi_filename": item["midi_filename"],
+            "mode": mode,
+        }
+
+        try:
+            if mode == "unsupervised":
+                counts = process_track_unsupervised(audio_path, midi_path, args)
+            elif mode == "supervised":
+                counts = process_track_supervised(audio_path, midi_path, args, W_fixed)
+            else:
+                raise ValueError(f"Unknown mode: {mode}")
+
+            row.update(counts)
+            row = add_metrics_to_row(row)
+
+        except Exception as exc:
+            row["error"] = str(exc)
+            print(f"Ошибка на треке {audio_path}: {exc}")
+
+        rows.append(row)
+
+    elapsed = time.time() - start_time
+
+    valid_rows = [r for r in rows if "error" not in r]
+
+    config = vars(args).copy()
+    config["mode"] = mode
+
+    summary = aggregate_results(
+        per_track_rows=valid_rows,
+        config=config,
+        elapsed_seconds=elapsed,
+    )
+
+    csv_path = output_dir / f"{mode}_nmf_per_track.csv"
+    json_path = output_dir / f"{mode}_nmf_summary.json"
+
+    pd.DataFrame(rows).to_csv(csv_path, index=False)
+
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2, ensure_ascii=False)
+
+    print(f"\nSaved per-track results: {csv_path}")
+    print(f"Saved summary: {json_path}")
+    print(json.dumps(summary, indent=2, ensure_ascii=False))
+
+    return summary
+
+
+def parse_args():
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument("--dataset-root", type=str, required=True)
+    parser.add_argument("--output-dir", type=str, required=True)
+    parser.add_argument("--isolated-notes-dir", type=str, default=None)
+
+    parser.add_argument(
+        "--mode",
+        type=str,
+        default="both",
+        choices=["unsupervised", "supervised", "both"],
+    )
+
+    parser.add_argument("--split", type=str, default="test")
+    parser.add_argument("--max-tracks", type=int, default=None)
+
+    parser.add_argument("--sample-rate", type=int, default=8000)
+    parser.add_argument("--n-fft", type=int, default=2048)
+    parser.add_argument("--hop-length", type=int, default=512)
+
+    parser.add_argument("--nmf-components", type=int, default=88)
+    parser.add_argument("--nmf-max-iter", type=int, default=400)
+    parser.add_argument("--random-seed", type=int, default=42)
+
+    parser.add_argument("--relative-threshold", type=float, default=0.2)
+    parser.add_argument("--top-k", type=int, default=5)
+    parser.add_argument("--smooth-window", type=int, default=3)
+    parser.add_argument("--min-active-frames", type=int, default=2)
+
+    parser.add_argument("--onset-tolerance", type=float, default=0.05)
+
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+
+    dataset_root = Path(args.dataset_root)
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    metadata_df = load_maestro_metadata(dataset_root, split=args.split)
+
+    print(f"Dataset root: {dataset_root}")
+    print(f"Split: {args.split}")
+    print(f"Tracks in split: {len(metadata_df)}")
+    print(f"Mode: {args.mode}")
+
+    modes = []
+    if args.mode == "both":
+        modes = ["unsupervised", "supervised"]
+    else:
+        modes = [args.mode]
+
+    W_fixed = None
+
+    if "supervised" in modes:
+        W_fixed = build_w_fixed(
+            isolated_notes_dir=Path(args.isolated_notes_dir),
+            sample_rate=args.sample_rate,
+            n_fft=args.n_fft,
+            hop_length=args.hop_length,
+        )
+
+        w_path = output_dir / "W_fixed.npy"
+        np.save(w_path, W_fixed)
+        print(f"Saved W_fixed: {w_path}")
+
+    for mode in modes:
+        run_mode(args, mode=mode, metadata_df=metadata_df, W_fixed=W_fixed)
+
+
+if __name__ == "__main__":
+    main()

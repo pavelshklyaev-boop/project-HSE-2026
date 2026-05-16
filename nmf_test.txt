@@ -1,0 +1,104 @@
+ак запускать Unsupervised NMF
+!python "/content/drive/MyDrive/CompactAMTmodels/colab_scripts/04_run_nmf_baselines.py" \
+  --dataset-root "/content/drive/MyDrive/maestro-v3.0.0" \
+  --output-dir "/content/drive/MyDrive/CompactAMTmodels/nmf_results" \
+  --mode unsupervised \
+  --split test \
+  --sample-rate 8000 \
+  --n-fft 2048 \
+  --hop-length 512 \
+  --nmf-components 88 \
+  --nmf-max-iter 400 \
+  --relative-threshold 0.2 \
+  --top-k 5 \
+  --smooth-window 3 \
+  --min-active-frames 2 \
+  --onset-tolerance 0.05
+4. Как запускать Supervised / semi-supervised NMF
+
+Для supervised NMF нужна папка с отдельными нотами:
+
+isolated_piano_notes/
+├── A0.wav
+├── A#0.wav
+├── B0.wav
+├── C1.wav
+...
+└── C8.wav
+
+Команда:
+
+!python "/content/drive/MyDrive/CompactAMTmodels/colab_scripts/04_run_nmf_baselines.py" \
+  --dataset-root "/content/drive/MyDrive/maestro-v3.0.0" \
+  --output-dir "/content/drive/MyDrive/CompactAMTmodels/nmf_results" \
+  --isolated-notes-dir "/content/drive/MyDrive/CompactAMTmodels/isolated_piano_notes" \
+  --mode supervised \
+  --split test \
+  --sample-rate 8000 \
+  --n-fft 2048 \
+  --hop-length 512 \
+  --nmf-components 88 \
+  --nmf-max-iter 400 \
+  --relative-threshold 0.2 \
+  --top-k 5 \
+  --smooth-window 3 \
+  --min-active-frames 2 \
+  --onset-tolerance 0.05
+5. Запуск сразу обоих методов
+!python "/content/drive/MyDrive/CompactAMTmodels/colab_scripts/04_run_nmf_baselines.py" \
+  --dataset-root "/content/drive/MyDrive/maestro-v3.0.0" \
+  --output-dir "/content/drive/MyDrive/CompactAMTmodels/nmf_results" \
+  --isolated-notes-dir "/content/drive/MyDrive/CompactAMTmodels/isolated_piano_notes" \
+  --mode both \
+  --split test \
+  --sample-rate 8000 \
+  --n-fft 2048 \
+  --hop-length 512 \
+  --nmf-components 88 \
+  --nmf-max-iter 400 \
+  --relative-threshold 0.2 \
+  --top-k 5 \
+  --smooth-window 3 \
+  --min-active-frames 2 \
+  --onset-tolerance 0.05
+6. Для быстрой проверки на 5 треках
+
+Сначала лучше запустить не весь test split, а несколько треков:
+
+!python "/content/drive/MyDrive/CompactAMTmodels/colab_scripts/04_run_nmf_baselines.py" \
+  --dataset-root "/content/drive/MyDrive/maestro-v3.0.0" \
+  --output-dir "/content/drive/MyDrive/CompactAMTmodels/nmf_results_debug" \
+  --isolated-notes-dir "/content/drive/MyDrive/CompactAMTmodels/isolated_piano_notes" \
+  --mode both \
+  --split test \
+  --max-tracks 5
+7. Где будут результаты
+
+После запуска появятся файлы:
+
+/content/drive/MyDrive/CompactAMTmodels/nmf_results/
+├── unsupervised_nmf_summary.json
+├── unsupervised_nmf_per_track.csv
+├── supervised_nmf_summary.json
+├── supervised_nmf_per_track.csv
+└── W_fixed.npy
+
+Главные файлы:
+
+unsupervised_nmf_summary.json
+supervised_nmf_summary.json
+
+В них будут итоговые метрики:
+
+{
+  "frame_micro": {
+    "precision": 0.0,
+    "recall": 0.0,
+    "f1": 0.0
+  },
+  "note_onset_micro": {
+    "precision": 0.0,
+    "recall": 0.0,
+    "f1": 0.0
+  }
+}
